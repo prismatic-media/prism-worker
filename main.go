@@ -433,15 +433,20 @@ func executeJob(ctx context.Context, job *TranscodeJob, hwaccel string) error {
 	// 6. Transcode
 	slog.Info("Starting transcode process", "job_id", job.ID)
 	opts := ffmpeg.TranscodeOptions{
-		InputPath:       sourcePath,
-		OutputDir:       outputDir,
-		Profiles:        profiles,
-		Duration:        probe.Duration,
-		SourceWidth:     probe.Width,
-		SourceHeight:    probe.Height,
-		SubtitleStreams: probe.SubtitleStreams,
-		ProgressFn:      progressFn,
-		HWAccelType:     hwaccel,
+		InputPath:            sourcePath,
+		OutputDir:            outputDir,
+		Profiles:             profiles,
+		Duration:             probe.Duration,
+		SourceWidth:          probe.Width,
+		SourceHeight:         probe.Height,
+		SubtitleStreams:      probe.SubtitleStreams,
+		ProgressFn:           progressFn,
+		HWAccelType:          hwaccel,
+		SourceIsHDR:          probe.IsHDR(),
+		SourcePixFmt:         probe.PixFmt,
+		SourceColorSpace:     probe.ColorSpace,
+		SourceColorTransfer:  probe.ColorTransfer,
+		SourceColorPrimaries: probe.ColorPrimaries,
 	}
 
 	if err := ffmpeg.TranscodeDASH(ctx, config.FFmpegPath, opts); err != nil {

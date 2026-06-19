@@ -22,7 +22,19 @@ type ProbeResult struct {
 	VideoCodec      string
 	AudioCodec      string
 	SubtitleStreams []SubtitleStream
+	PixFmt          string
+	ColorSpace      string
+	ColorTransfer   string
+	ColorPrimaries  string
 }
+
+// IsHDR reports whether the video stream has HDR characteristics.
+func (p *ProbeResult) IsHDR() bool {
+	return p.ColorTransfer == "smpte2084" || p.ColorTransfer == "arib-std-b67" ||
+		p.ColorSpace == "bt2020nc" || p.ColorPrimaries == "bt2020" ||
+		strings.Contains(strings.ToLower(p.PixFmt), "10")
+}
+
 
 // SubtitleStream describes an embedded subtitle track.
 type SubtitleStream struct {
@@ -61,12 +73,16 @@ func Probe(ctx context.Context, ffprobePath, filePath string) (*ProbeResult, err
 
 	var raw struct {
 		Streams []struct {
-			Index     int    `json:"index"`
-			CodecType string `json:"codec_type"`
-			CodecName string `json:"codec_name"`
-			Width     int    `json:"width"`
-			Height    int    `json:"height"`
-			Tags      struct {
+			Index          int    `json:"index"`
+			CodecType      string `json:"codec_type"`
+			CodecName      string `json:"codec_name"`
+			Width          int    `json:"width"`
+			Height         int    `json:"height"`
+			PixFmt         string `json:"pix_fmt"`
+			ColorSpace     string `json:"color_space"`
+			ColorTransfer  string `json:"color_transfer"`
+			ColorPrimaries string `json:"color_primaries"`
+			Tags           struct {
 				Language string `json:"language"`
 			} `json:"tags"`
 		} `json:"streams"`
@@ -86,6 +102,10 @@ func Probe(ctx context.Context, ffprobePath, filePath string) (*ProbeResult, err
 			result.VideoCodec = s.CodecName
 			result.Width = s.Width
 			result.Height = s.Height
+			result.PixFmt = s.PixFmt
+			result.ColorSpace = s.ColorSpace
+			result.ColorTransfer = s.ColorTransfer
+			result.ColorPrimaries = s.ColorPrimaries
 		case "audio":
 			result.AudioCodec = s.CodecName
 		case "subtitle":
@@ -129,16 +149,21 @@ func DefaultProfiles() []RenditionProfile {
 
 // TranscodeOptions configures a DASH transcode operation.
 type TranscodeOptions struct {
-	InputPath       string
-	OutputDir       string
-	Profiles        []RenditionProfile
-	SegmentDuration int           // seconds, default 4
-	Duration        float64       // total input duration in seconds; used for progress
-	SourceWidth     int           // source video width in pixels; used to pick scale filter
-	SourceHeight    int           // source video height in pixels; used to pick scale filter
-	ProgressFn      func(float64) // called with 0–100 overall percent; may be nil
-	SubtitleStreams []SubtitleStream
-	HWAccelType     string
+	InputPath            string
+	OutputDir            string
+	Profiles             []RenditionProfile
+	SegmentDuration      int           // seconds, default 4
+	Duration             float64       // total input duration in seconds; used for progress
+	SourceWidth          int           // source video width in pixels; used to pick scale filter
+	SourceHeight         int           // source video height in pixels; used to pick scale filter
+	ProgressFn           func(float64) // called with 0–100 overall percent; may be nil
+	SubtitleStreams      []SubtitleStream
+	HWAccelType          string
+	SourceIsHDR          bool
+	SourcePixFmt         string
+	SourceColorSpace     string
+	SourceColorTransfer  string
+	SourceColorPrimaries string
 }
 
 // reProgress matches FFmpeg progress lines: "out_time_ms=12345678"
@@ -394,6 +419,21 @@ func runCmd(ctx context.Context, bin string, args []string) ([]byte, error) {
 
 func buildTranscodeArgs(opts TranscodeOptions, p RenditionProfile, scaleFilter string) (string, []string) {
 	var codec string
+
+	// Set up source color properties with safe fallbacks
+	itrc := "smpte2084"
+	if opts.SourceColorTransfer != "" {
+		itrc = opts.SourceColorTransfer
+	}
+	iprim := "bt2020"
+	if opts.SourceColorPrimaries != "" {
+		iprim = opts.SourceColorPrimaries
+	}
+	ispace := "bt2020nc"
+	if opts.SourceColorSpace != "" {
+		ispace = opts.SourceColorSpace
+	}
+
 	switch p.Codec {
 	case "hevc":
 		switch opts.HWAccelType {
@@ -405,7 +445,11 @@ func buildTranscodeArgs(opts TranscodeOptions, p RenditionProfile, scaleFilter s
 			codec = "hevc_videotoolbox"
 		case "vaapi":
 			codec = "hevc_vaapi"
-			scaleFilter += ",format=nv12,hwupload"
+			if opts.SourceIsHDR {
+				scaleFilter += ",format=p010,hwupload"
+			} else {
+				scaleFilter += ",format=nv12,hwupload"
+			}
 		default:
 			codec = "libx265"
 		}
@@ -417,7 +461,11 @@ func buildTranscodeArgs(opts TranscodeOptions, p RenditionProfile, scaleFilter s
 			codec = "av1_qsv"
 		case "vaapi":
 			codec = "av1_vaapi"
-			scaleFilter += ",format=nv12,hwupload"
+			if opts.SourceIsHDR {
+				scaleFilter += ",format=p010,hwupload"
+			} else {
+				scaleFilter += ",format=nv12,hwupload"
+			}
 		default:
 			codec = "libsvtav1"
 		}
@@ -431,10 +479,24 @@ func buildTranscodeArgs(opts TranscodeOptions, p RenditionProfile, scaleFilter s
 			codec = "h264_videotoolbox"
 		case "vaapi":
 			codec = "h264_vaapi"
-			scaleFilter += ",format=nv12,hwupload"
+			if opts.SourceIsHDR {
+				// Software SDR tone-mapping before uploading nv12 to VAAPI
+				scaleFilter = fmt.Sprintf("%s,zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=nv12,hwupload",
+					scaleFilter,
+				)
+			} else {
+				scaleFilter += ",format=nv12,hwupload"
+			}
 		default:
 			codec = "libx264"
 		}
+	}
+
+	// Apply software tone-mapping to non-VAAPI H.264 streams if source is HDR
+	if opts.SourceIsHDR && (p.Codec == "h264" || p.Codec == "") && opts.HWAccelType != "vaapi" {
+		scaleFilter = fmt.Sprintf("%s,zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p",
+			scaleFilter,
+		)
 	}
 
 	var args []string
@@ -448,6 +510,21 @@ func buildTranscodeArgs(opts TranscodeOptions, p RenditionProfile, scaleFilter s
 		"-map", "0:a:0",
 		"-c:v", codec,
 		"-b:v", fmt.Sprintf("%dk", p.VideoBitrateK),
+	)
+
+	// Preserve HDR quality metadata for AV1/HEVC streams if source is HDR
+	if opts.SourceIsHDR && (p.Codec == "av1" || p.Codec == "hevc") {
+		if opts.HWAccelType != "vaapi" {
+			args = append(args, "-pix_fmt", "yuv420p10le")
+		}
+		args = append(args,
+			"-color_primaries", iprim,
+			"-color_trc", itrc,
+			"-colorspace", ispace,
+		)
+	}
+
+	args = append(args,
 		"-vf", scaleFilter,
 		"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", opts.SegmentDuration),
 		"-c:a", "aac",

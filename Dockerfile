@@ -15,7 +15,9 @@ RUN mkdir -p /app/scratch && chown -R appuser:appgroup /app
 USER appuser
 
 # Copy the pre-built static binary into the container
-COPY prism-worker /app/prism-worker
+ARG TARGETARCH
+ARG BINARY_NAME=prism-worker-linux-${TARGETARCH}
+COPY ${BINARY_NAME} /app/prism-worker
 
 # Expose default environment configuration for paths used by the worker
 ENV PRISM_FFMPEG_PATH="/usr/bin/ffmpeg" \
