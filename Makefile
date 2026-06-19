@@ -6,7 +6,7 @@ CMD        := main.go
 all: build
 
 build:
-	go build -o $(BINARY) $(CMD)
+	CGO_ENABLED=0 go build -o $(BINARY) $(CMD)
 
 run: build
 	./$(BINARY)

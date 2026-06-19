@@ -48,12 +48,14 @@ jobs:
 
       - name: Build Worker Binary (Linux amd64)
         env:
+          CGO_ENABLED: 0
           GOOS: linux
           GOARCH: amd64
         run: go build -v -o prism-worker-linux-amd64 main.go
 
       - name: Build Worker Binary (Linux arm64)
         env:
+          CGO_ENABLED: 0
           GOOS: linux
           GOARCH: arm64
         run: go build -v -o prism-worker-linux-arm64 main.go
