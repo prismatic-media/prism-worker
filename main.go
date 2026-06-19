@@ -30,6 +30,8 @@ type WorkerConfig struct {
 	FFmpegPath  string `json:"ffmpeg_path" yaml:"ffmpeg_path"`
 	FFprobePath string `json:"ffprobe_path" yaml:"ffprobe_path"`
 	ScratchDir  string `json:"scratch_dir" yaml:"scratch_dir"`
+	Ephemeral   bool   `json:"ephemeral" yaml:"ephemeral"`
+	Token       string `json:"token" yaml:"token"`
 }
 
 type TranscodeJob struct {
@@ -88,32 +90,165 @@ func parseYAMLConfig(data []byte, cfg *WorkerConfig) error {
 			cfg.FFprobePath = val
 		case "scratch_dir":
 			cfg.ScratchDir = val
+		case "ephemeral":
+			cfg.Ephemeral = (val == "true" || val == "1" || val == "yes")
+		case "token":
+			cfg.Token = val
 		}
 	}
 	return nil
 }
 
-func main() {
-	configFlag := flag.String("config", "worker_config.yaml", "Path to worker configuration YAML file")
-	flag.Parse()
+func LoadConfig(args []string, getenv func(string) string, readFile func(string) ([]byte, error)) (WorkerConfig, error) {
+	fs := flag.NewFlagSet("prism-worker", flag.ContinueOnError)
 
+	configFlag := fs.String("config", "worker_config.yaml", "Path to worker configuration YAML file")
+	ephemeralFlag := fs.Bool("ephemeral", false, "Run worker in ephemeral mode")
+	tokenFlag := fs.String("token", "", "Ephemeral registration token")
+	serverFlag := fs.String("server", "", "Prism server URL (e.g. http://localhost:8080)")
+	serverURLFlag := fs.String("server-url", "", "Prism server URL (alternative)")
+	apiKeyFlag := fs.String("api-key", "", "API key for worker authentication")
+	ffmpegPathFlag := fs.String("ffmpeg-path", "", "Path to ffmpeg executable")
+	ffprobePathFlag := fs.String("ffprobe-path", "", "Path to ffprobe executable")
+	scratchDirFlag := fs.String("scratch-dir", "", "Scratch directory path")
+
+	if err := fs.Parse(args); err != nil {
+		return WorkerConfig{}, err
+	}
+
+	setFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		setFlags[f.Name] = true
+	})
+
+	var cfg WorkerConfig
+
+	// 1. Determine config file path
+	configPath := "worker_config.yaml"
+	if envVal := getenv("PRISM_CONFIG"); envVal != "" {
+		configPath = envVal
+	}
+	if setFlags["config"] {
+		configPath = *configFlag
+	}
+
+	// 2. Load YAML file if exists
+	data, err := readFile(configPath)
+	if err == nil {
+		if err := parseYAMLConfig(data, &cfg); err != nil {
+			return WorkerConfig{}, fmt.Errorf("parsing yaml config: %w", err)
+		}
+	} else {
+		// If explicitly requested config path, return error. Otherwise ignore missing config file
+		configPathExplicit := setFlags["config"] || getenv("PRISM_CONFIG") != ""
+		if configPathExplicit {
+			return WorkerConfig{}, fmt.Errorf("reading config file %q: %w", configPath, err)
+		}
+	}
+
+	// 3. Environment Variables
+	if envVal := getenv("PRISM_EPHEMERAL"); envVal != "" {
+		cfg.Ephemeral = (envVal == "true" || envVal == "1" || envVal == "yes")
+	}
+	if envVal := getenv("PRISM_TOKEN"); envVal != "" {
+		cfg.Token = envVal
+	}
+	if envVal := getenv("PRISM_SERVER_URL"); envVal != "" {
+		cfg.ServerURL = envVal
+	}
+	if envVal := getenv("PRISM_API_KEY"); envVal != "" {
+		cfg.APIKey = envVal
+	}
+	if envVal := getenv("PRISM_FFMPEG_PATH"); envVal != "" {
+		cfg.FFmpegPath = envVal
+	}
+	if envVal := getenv("PRISM_FFPROBE_PATH"); envVal != "" {
+		cfg.FFprobePath = envVal
+	}
+	if envVal := getenv("PRISM_SCRATCH_DIR"); envVal != "" {
+		cfg.ScratchDir = envVal
+	}
+
+	// 4. Command Line Flags
+	if setFlags["ephemeral"] {
+		cfg.Ephemeral = *ephemeralFlag
+	}
+	if setFlags["token"] {
+		cfg.Token = *tokenFlag
+	}
+	if setFlags["server"] {
+		cfg.ServerURL = *serverFlag
+	}
+	if setFlags["server-url"] {
+		cfg.ServerURL = *serverURLFlag
+	}
+	if setFlags["api-key"] {
+		cfg.APIKey = *apiKeyFlag
+	}
+	if setFlags["ffmpeg-path"] {
+		cfg.FFmpegPath = *ffmpegPathFlag
+	}
+	if setFlags["ffprobe-path"] {
+		cfg.FFprobePath = *ffprobePathFlag
+	}
+	if setFlags["scratch-dir"] {
+		cfg.ScratchDir = *scratchDirFlag
+	}
+
+	// Set defaults
+	if cfg.FFmpegPath == "" {
+		cfg.FFmpegPath = "ffmpeg"
+	}
+	if cfg.FFprobePath == "" {
+		cfg.FFprobePath = "ffprobe"
+	}
+
+	return cfg, nil
+}
+
+func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	// Load configuration from file
-	data, err := os.ReadFile(*configFlag)
+	var err error
+	config, err = LoadConfig(os.Args[1:], os.Getenv, os.ReadFile)
 	if err != nil {
-		slog.Error("failed to read config file", "path", *configFlag, "error", err)
-		os.Exit(1)
-	}
-	if err := parseYAMLConfig(data, &config); err != nil {
-		slog.Error("failed to parse config file", "path", *configFlag, "error", err)
+		slog.Error("failed to load configuration", "error", err)
 		os.Exit(1)
 	}
 
-	if config.ServerURL == "" || config.APIKey == "" {
-		slog.Error("invalid configuration: server_url and api_key are required")
-		os.Exit(1)
+	if config.Ephemeral {
+		if config.Token == "" {
+			slog.Error("ephemeral mode requires a --token")
+			os.Exit(1)
+		}
+		if config.ServerURL == "" {
+			slog.Error("ephemeral mode requires a --server URL")
+			os.Exit(1)
+		}
+		if !strings.HasPrefix(config.ServerURL, "http://") && !strings.HasPrefix(config.ServerURL, "https://") {
+			slog.Error("invalid server URL: must start with http:// or https://")
+			os.Exit(1)
+		}
+
+		name, err := os.Hostname()
+		if err != nil {
+			name = "ephemeral-worker-" + uuid.New().String()[:8]
+		}
+
+		slog.Info("Registering ephemeral worker", "server", config.ServerURL, "name", name)
+		apiKey, err := registerEphemeral(config.ServerURL, config.Token, name)
+		if err != nil {
+			slog.Error("failed to register ephemeral worker", "error", err)
+			os.Exit(1)
+		}
+
+		config.APIKey = apiKey
+	} else {
+		if config.ServerURL == "" || config.APIKey == "" {
+			slog.Error("invalid configuration: server_url and api_key are required")
+			os.Exit(1)
+		}
 	}
 
 	config.ServerURL = strings.TrimSuffix(config.ServerURL, "/")
@@ -536,4 +671,43 @@ func cleanScratchDir(dir string) error {
 		}
 	}
 	return nil
+}
+
+type RegisterPayload struct {
+	Name  string `json:"name"`
+	Token string `json:"token"`
+}
+
+type RegisterResponse struct {
+	APIKey string `json:"api_key"`
+}
+
+func registerEphemeral(serverURL, token, name string) (string, error) {
+	payload := RegisterPayload{
+		Name:  name,
+		Token: token,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	url := fmt.Sprintf("%s/api/v1/worker/register", strings.TrimSuffix(serverURL, "/"))
+	resp, err := http.Post(url, "application/json", bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("server returned status %s: %s", resp.Status, string(bodyBytes))
+	}
+
+	var res RegisterResponse
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", err
+	}
+
+	return res.APIKey, nil
 }
