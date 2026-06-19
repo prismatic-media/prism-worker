@@ -109,20 +109,21 @@ func Probe(ctx context.Context, ffprobePath, filePath string) (*ProbeResult, err
 
 // RenditionProfile defines a single DASH quality level.
 type RenditionProfile struct {
-	Name          string
-	Height        int
-	Width         int // standard reference width (e.g. 1920 for 1080p); used for wide-format sources
-	VideoBitrateK int // kbps
-	AudioBitrateK int // kbps
+	Name          string `json:"name"`
+	Height        int    `json:"height"`
+	Width         int    `json:"width"` // standard reference width (e.g. 1920 for 1080p); used for wide-format sources
+	VideoBitrateK int    `json:"video_bitrate_k"`
+	AudioBitrateK int    `json:"audio_bitrate_k"`
+	Codec         string `json:"codec"` // e.g. "h264", "hevc", "av1"
 }
 
 // DefaultProfiles returns the standard set of DASH renditions.
 func DefaultProfiles() []RenditionProfile {
 	return []RenditionProfile{
-		{Name: "360p",  Height: 360,  Width: 640,  VideoBitrateK: 400,  AudioBitrateK: 64},
-		{Name: "480p",  Height: 480,  Width: 854,  VideoBitrateK: 800,  AudioBitrateK: 96},
-		{Name: "720p",  Height: 720,  Width: 1280, VideoBitrateK: 2500, AudioBitrateK: 128},
-		{Name: "1080p", Height: 1080, Width: 1920, VideoBitrateK: 8000, AudioBitrateK: 192},
+		{Name: "360p",  Height: 360,  Width: 640,  VideoBitrateK: 400,  AudioBitrateK: 64,  Codec: "h264"},
+		{Name: "480p",  Height: 480,  Width: 854,  VideoBitrateK: 800,  AudioBitrateK: 96,  Codec: "h264"},
+		{Name: "720p",  Height: 720,  Width: 1280, VideoBitrateK: 2500, AudioBitrateK: 128, Codec: "h264"},
+		{Name: "1080p", Height: 1080, Width: 1920, VideoBitrateK: 8000, AudioBitrateK: 192, Codec: "h264"},
 	}
 }
 
@@ -393,18 +394,47 @@ func runCmd(ctx context.Context, bin string, args []string) ([]byte, error) {
 
 func buildTranscodeArgs(opts TranscodeOptions, p RenditionProfile, scaleFilter string) (string, []string) {
 	var codec string
-	switch opts.HWAccelType {
-	case "nvenc":
-		codec = "h264_nvenc"
-	case "qsv":
-		codec = "h264_qsv"
-	case "videotoolbox":
-		codec = "h264_videotoolbox"
-	case "vaapi":
-		codec = "h264_vaapi"
-		scaleFilter += ",format=nv12,hwupload"
-	default:
-		codec = "libx264"
+	switch p.Codec {
+	case "hevc":
+		switch opts.HWAccelType {
+		case "nvenc":
+			codec = "hevc_nvenc"
+		case "qsv":
+			codec = "hevc_qsv"
+		case "videotoolbox":
+			codec = "hevc_videotoolbox"
+		case "vaapi":
+			codec = "hevc_vaapi"
+			scaleFilter += ",format=nv12,hwupload"
+		default:
+			codec = "libx265"
+		}
+	case "av1":
+		switch opts.HWAccelType {
+		case "nvenc":
+			codec = "av1_nvenc"
+		case "qsv":
+			codec = "av1_qsv"
+		case "vaapi":
+			codec = "av1_vaapi"
+			scaleFilter += ",format=nv12,hwupload"
+		default:
+			codec = "libsvtav1"
+		}
+	default: // h264
+		switch opts.HWAccelType {
+		case "nvenc":
+			codec = "h264_nvenc"
+		case "qsv":
+			codec = "h264_qsv"
+		case "videotoolbox":
+			codec = "h264_videotoolbox"
+		case "vaapi":
+			codec = "h264_vaapi"
+			scaleFilter += ",format=nv12,hwupload"
+		default:
+			codec = "libx264"
+		}
 	}
 
 	var args []string

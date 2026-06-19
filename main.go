@@ -35,8 +35,9 @@ type WorkerConfig struct {
 }
 
 type TranscodeJob struct {
-	ID          uuid.UUID `json:"id"`
-	MediaItemID uuid.UUID `json:"media_item_id"`
+	ID          uuid.UUID                 `json:"id"`
+	MediaItemID uuid.UUID                 `json:"media_item_id"`
+	Profiles    []ffmpeg.RenditionProfile `json:"profiles"`
 }
 
 type HeartbeatResponse struct {
@@ -393,7 +394,12 @@ func executeJob(ctx context.Context, job *TranscodeJob, hwaccel string) error {
 	}
 
 	// 4. Configure profiles
-	profiles := ffmpeg.DefaultProfiles()
+	var profiles []ffmpeg.RenditionProfile
+	if len(job.Profiles) > 0 {
+		profiles = job.Profiles
+	} else {
+		profiles = ffmpeg.DefaultProfiles()
+	}
 	if probe.Height > 0 && probe.Width > 0 {
 		var filtered []ffmpeg.RenditionProfile
 		for _, prof := range profiles {
@@ -452,6 +458,7 @@ func executeJob(ctx context.Context, job *TranscodeJob, hwaccel string) error {
 			Height:        prof.Height,
 			VideoBitrateK: prof.VideoBitrateK,
 			AudioBitrateK: prof.AudioBitrateK,
+			Codec:         prof.Codec,
 		}
 	}
 
