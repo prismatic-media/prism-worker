@@ -11,13 +11,13 @@ RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 WORKDIR /app
 RUN mkdir -p /app/scratch && chown -R appuser:appgroup /app
 
-# Switch to the non-root user
-USER appuser
-
-# Copy the pre-built static binary into the container
+# Copy the pre-built static binary into the container and ensure it is executable and owned by appuser
 ARG TARGETARCH
 ARG BINARY_NAME=prism-worker-linux-${TARGETARCH}
-COPY ${BINARY_NAME} /app/prism-worker
+COPY --chown=appuser:appgroup --chmod=755 ${BINARY_NAME} /app/prism-worker
+
+# Switch to the non-root user
+USER appuser
 
 # Expose default environment configuration for paths used by the worker
 ENV PRISM_FFMPEG_PATH="/usr/bin/ffmpeg" \

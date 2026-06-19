@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prism-worker
+  namespace: default
+  labels:
+    app: prism-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prism-worker
+  template:
+    metadata:
+      labels:
+        app: prism-worker
+    spec:
+      containers:
+        - name: prism-worker
+          image: ghcr.io/prismatic-media/prism-worker:v0.1.4
+          imagePullPolicy: IfNotPresent
+          env:
+            # The URL of the main prism-server. Update this to match your cluster's DNS or external address.
+            - name: PRISM_SERVER_URL
+              value: "http://prism-server-service.default.svc.cluster.local:8080"
+            
+            # The registration token for ephemeral workers. Update this with your actual token.
+            - name: PRISM_TOKEN
+              value: "your-ephemeral-registration-token-here"
+            
+            # Set to true to automatically register this worker as an ephemeral worker.
+            - name: PRISM_EPHEMERAL
+              value: "true"
+
+            # Optional: Override paths or log configuration if needed
+            - name: PRISM_FFMPEG_PATH
+              value: "/usr/bin/ffmpeg"
+            - name: PRISM_FFPROBE_PATH
+              value: "/usr/bin/ffprobe"
+            - name: PRISM_SCRATCH_DIR
+              value: "/app/scratch"
+          resources:
+            requests:
+              cpu: "3"
+              memory: "5Gi"
+            limits:
+              # No CPU limit is specified to allow the container to utilize spare host CPU capacity during peaks
+              memory: "6Gi"
+          volumeMounts:
+            - name: scratch-storage
+              mountPath: /app/scratch
+      volumes:
+        - name: scratch-storage
+          emptyDir: {}

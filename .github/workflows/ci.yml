@@ -132,6 +132,9 @@ jobs:
           name: release-binaries
           path: ./
 
+      - name: Make binaries executable
+        run: chmod +x prism-worker-linux-*
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
