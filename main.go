@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/prismatic-media/prism-worker/pkg/dash"
 	"github.com/prismatic-media/prism-worker/pkg/ffmpeg"
 )
 
@@ -34,16 +33,18 @@ type WorkerConfig struct {
 	Token       string `json:"token" yaml:"token"`
 }
 
-type TranscodeJob struct {
-	ID          uuid.UUID                 `json:"id"`
-	MediaItemID uuid.UUID                 `json:"media_item_id"`
-	Profiles    []ffmpeg.RenditionProfile `json:"profiles"`
+type TranscodeSubJob struct {
+	ID          uuid.UUID                `json:"id"`
+	JobID       uuid.UUID                `json:"job_id"`
+	MediaItemID uuid.UUID                `json:"media_item_id"`
+	Type        string                   `json:"type"` // "video" or "subtitles"
+	Profile     *ffmpeg.RenditionProfile `json:"profile,omitempty"`
 }
 
 type HeartbeatResponse struct {
-	Threads int           `json:"threads"`
-	HWAccel string        `json:"hwaccel"`
-	Job     *TranscodeJob `json:"job"`
+	Threads int              `json:"threads"`
+	HWAccel string           `json:"hwaccel"`
+	Job     *TranscodeSubJob `json:"job"`
 }
 
 type ProgressRequest struct {
@@ -345,7 +346,7 @@ func poll(ctx context.Context) {
 	}
 
 	if hr.Job != nil {
-		slog.Info("Claimed transcode job", "job_id", hr.Job.ID, "media_item_id", hr.Job.MediaItemID, "hwaccel", hr.HWAccel)
+		slog.Info("Claimed transcode sub-job", "sub_job_id", hr.Job.ID, "job_id", hr.Job.JobID, "media_item_id", hr.Job.MediaItemID, "type", hr.Job.Type, "hwaccel", hr.HWAccel)
 
 		mu.Lock()
 		jobCtx, jobCancel := context.WithCancel(ctx)
@@ -362,16 +363,16 @@ func poll(ctx context.Context) {
 			
 			err := executeJob(jobCtx, hr.Job, hr.HWAccel)
 			if err != nil {
-				slog.Error("Job execution failed", "job_id", hr.Job.ID, "error", err)
+				slog.Error("Job execution failed", "sub_job_id", hr.Job.ID, "error", err)
 				reportFailure(ctx, hr.Job.ID, err.Error())
 			} else {
-				slog.Info("Job execution succeeded", "job_id", hr.Job.ID)
+				slog.Info("Job execution succeeded", "sub_job_id", hr.Job.ID)
 			}
 		}()
 	}
 }
 
-func executeJob(ctx context.Context, job *TranscodeJob, hwaccel string) error {
+func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) error {
 	// 1. Create temporary directory
 	tempDir, err := os.MkdirTemp(config.ScratchDir, fmt.Sprintf("prism-job-%s-", job.ID))
 	if err != nil {
@@ -382,7 +383,7 @@ func executeJob(ctx context.Context, job *TranscodeJob, hwaccel string) error {
 	sourcePath := filepath.Join(tempDir, "source.tmp")
 
 	// 2. Download media
-	slog.Info("Downloading source media file", "job_id", job.ID, "media_item_id", job.MediaItemID)
+	slog.Info("Downloading source media file", "sub_job_id", job.ID, "media_item_id", job.MediaItemID)
 	if err := downloadFile(ctx, job.MediaItemID, sourcePath); err != nil {
 		return fmt.Errorf("downloading source file: %w", err)
 	}
@@ -393,31 +394,12 @@ func executeJob(ctx context.Context, job *TranscodeJob, hwaccel string) error {
 		return fmt.Errorf("probing source file: %w", err)
 	}
 
-	// 4. Configure profiles
-	var profiles []ffmpeg.RenditionProfile
-	if len(job.Profiles) > 0 {
-		profiles = job.Profiles
-	} else {
-		profiles = ffmpeg.DefaultProfiles()
-	}
-	if probe.Height > 0 && probe.Width > 0 {
-		var filtered []ffmpeg.RenditionProfile
-		for _, prof := range profiles {
-			if prof.Height <= probe.Height || (prof.Width > 0 && probe.Width >= prof.Width) {
-				filtered = append(filtered, prof)
-			}
-		}
-		if len(filtered) > 0 {
-			profiles = filtered
-		}
-	}
-
 	outputDir := filepath.Join(tempDir, "output")
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return fmt.Errorf("creating output dir: %w", err)
 	}
 
-	// 5. Setup progress reporting rate limiter
+	// 4. Setup progress reporting rate limiter
 	var lastReport time.Time
 	var lastPct float64
 	progressFn := func(pct float64) {
@@ -425,76 +407,60 @@ func executeJob(ctx context.Context, job *TranscodeJob, hwaccel string) error {
 		if now.Sub(lastReport) > 2*time.Second || pct - lastPct > 1.0 || pct >= 99.0 {
 			lastReport = now
 			lastPct = pct
-			slog.Info("Transcode progress", "job_id", job.ID, "pct", fmt.Sprintf("%.1f%%", pct))
+			slog.Info("Transcode progress", "sub_job_id", job.ID, "pct", fmt.Sprintf("%.1f%%", pct))
 			reportProgress(ctx, job.ID, pct)
 		}
 	}
 
-	// 6. Transcode
-	slog.Info("Starting transcode process", "job_id", job.ID)
-	opts := ffmpeg.TranscodeOptions{
-		InputPath:            sourcePath,
-		OutputDir:            outputDir,
-		Profiles:             profiles,
-		Duration:             probe.Duration,
-		SourceWidth:          probe.Width,
-		SourceHeight:         probe.Height,
-		SubtitleStreams:      probe.SubtitleStreams,
-		ProgressFn:           progressFn,
-		HWAccelType:          hwaccel,
-		SourceIsHDR:          probe.IsHDR(),
-		SourcePixFmt:         probe.PixFmt,
-		SourceColorSpace:     probe.ColorSpace,
-		SourceColorTransfer:  probe.ColorTransfer,
-		SourceColorPrimaries: probe.ColorPrimaries,
-	}
-
-	if err := ffmpeg.TranscodeDASH(ctx, config.FFmpegPath, opts); err != nil {
-		return fmt.Errorf("transcode process: %w", err)
-	}
-
-	// 7. Generate DASH MPD
-	slog.Info("Generating MPD manifest", "job_id", job.ID)
-	mpdPath := filepath.Join(outputDir, "manifest.mpd")
-	renditions := make([]dash.RenditionInfo, len(profiles))
-	for i, prof := range profiles {
-		renditions[i] = dash.RenditionInfo{
-			Name:          prof.Name,
-			Height:        prof.Height,
-			VideoBitrateK: prof.VideoBitrateK,
-			AudioBitrateK: prof.AudioBitrateK,
-			Codec:         prof.Codec,
+	// 5. Transcode based on Type
+	if job.Type == "video" {
+		if job.Profile == nil {
+			return fmt.Errorf("video sub-job has no profile specified")
 		}
-	}
 
-	var subs []dash.SubtitleInfo
-	for _, s := range probe.SubtitleStreams {
-		lang := s.Language
-		if lang == "" {
-			lang = fmt.Sprintf("%d", s.Index)
+		slog.Info("Starting transcode process for profile", "sub_job_id", job.ID, "profile", job.Profile.Name)
+		opts := ffmpeg.TranscodeOptions{
+			InputPath:            sourcePath,
+			OutputDir:            outputDir,
+			Profiles:             []ffmpeg.RenditionProfile{*job.Profile},
+			Duration:             probe.Duration,
+			SourceWidth:          probe.Width,
+			SourceHeight:         probe.Height,
+			ProgressFn:           progressFn,
+			HWAccelType:          hwaccel,
+			SourceIsHDR:          probe.IsHDR(),
+			SourcePixFmt:         probe.PixFmt,
+			SourceColorSpace:     probe.ColorSpace,
+			SourceColorTransfer:  probe.ColorTransfer,
+			SourceColorPrimaries: probe.ColorPrimaries,
 		}
-		vttPath := filepath.Join(outputDir, "sub_"+lang+".vtt")
-		subs = append(subs, dash.SubtitleInfo{Language: lang, VTTPath: vttPath})
+
+		if err := ffmpeg.TranscodeDASH(ctx, config.FFmpegPath, opts); err != nil {
+			return fmt.Errorf("transcode process: %w", err)
+		}
+	} else if job.Type == "subtitles" {
+		slog.Info("Starting subtitle extraction", "sub_job_id", job.ID)
+		if err := ffmpeg.ExtractSubtitles(ctx, config.FFmpegPath, sourcePath, outputDir, probe.SubtitleStreams); err != nil {
+			slog.Warn("failed to extract embedded subtitles", "error", err)
+		}
+	} else {
+		return fmt.Errorf("unknown sub-job type: %s", job.Type)
 	}
 
-	if err := dash.GenerateMPD(outputDir, mpdPath, renditions, subs, probe.Duration); err != nil {
-		return fmt.Errorf("generating MPD manifest: %w", err)
-	}
-
-	// 8. Zip output directory
-	slog.Info("Zipping transcode output bundle", "job_id", job.ID)
+	// 6. Zip output directory
+	slog.Info("Zipping transcode output bundle", "sub_job_id", job.ID)
 	zipPath := filepath.Join(tempDir, "bundle.zip")
 	if err := zipDir(outputDir, zipPath); err != nil {
 		return fmt.Errorf("zipping outputs: %w", err)
 	}
 
-	// 9. Upload ZIP
-	slog.Info("Uploading transcode output bundle to server", "job_id", job.ID)
+	// 7. Upload ZIP
+	slog.Info("Uploading transcode output bundle to server", "sub_job_id", job.ID)
 	if err := uploadBundle(ctx, job.ID, zipPath); err != nil {
 		return fmt.Errorf("uploading bundle: %w", err)
 	}
 
-	slog.Info("Transcode job completed successfully", "job_id", job.ID)
+	slog.Info("Transcode sub-job completed successfully", "sub_job_id", job.ID)
 	return nil
 }
 
@@ -526,8 +492,8 @@ func downloadFile(ctx context.Context, mediaID uuid.UUID, destPath string) error
 	return err
 }
 
-func reportProgress(ctx context.Context, jobID uuid.UUID, progress float64) {
-	url := fmt.Sprintf("%s/api/v1/worker/jobs/%s/progress", config.ServerURL, jobID)
+func reportProgress(ctx context.Context, subJobID uuid.UUID, progress float64) {
+	url := fmt.Sprintf("%s/api/v1/worker/subjobs/%s/progress", config.ServerURL, subJobID)
 	payload := ProgressRequest{
 		Progress: progress,
 		Status:   "processing",
@@ -547,8 +513,8 @@ func reportProgress(ctx context.Context, jobID uuid.UUID, progress float64) {
 	}
 }
 
-func reportFailure(ctx context.Context, jobID uuid.UUID, errMsg string) {
-	url := fmt.Sprintf("%s/api/v1/worker/jobs/%s/progress", config.ServerURL, jobID)
+func reportFailure(ctx context.Context, subJobID uuid.UUID, errMsg string) {
+	url := fmt.Sprintf("%s/api/v1/worker/subjobs/%s/progress", config.ServerURL, subJobID)
 	payload := ProgressRequest{
 		Progress: 0,
 		Status:   "failed",
@@ -569,8 +535,8 @@ func reportFailure(ctx context.Context, jobID uuid.UUID, errMsg string) {
 	}
 }
 
-func uploadBundle(ctx context.Context, jobID uuid.UUID, zipPath string) error {
-	url := fmt.Sprintf("%s/api/v1/worker/jobs/%s/bundle", config.ServerURL, jobID)
+func uploadBundle(ctx context.Context, subJobID uuid.UUID, zipPath string) error {
+	url := fmt.Sprintf("%s/api/v1/worker/subjobs/%s/bundle", config.ServerURL, subJobID)
 
 	file, err := os.Open(zipPath)
 	if err != nil {
