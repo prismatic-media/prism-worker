@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -12,8 +13,11 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,11 +38,12 @@ type WorkerConfig struct {
 }
 
 type TranscodeSubJob struct {
-	ID          uuid.UUID                `json:"id"`
-	JobID       uuid.UUID                `json:"job_id"`
-	MediaItemID uuid.UUID                `json:"media_item_id"`
-	Type        string                   `json:"type"` // "video" or "subtitles"
-	Profile     *ffmpeg.RenditionProfile `json:"profile,omitempty"`
+	ID           uuid.UUID                `json:"id"`
+	JobID        uuid.UUID                `json:"job_id"`
+	MediaItemID  uuid.UUID                `json:"media_item_id"`
+	Type         string                   `json:"type"` // "video", "subtitles", or "whisper"
+	Profile      *ffmpeg.RenditionProfile `json:"profile,omitempty"`
+	WhisperModel string                   `json:"whisper_model,omitempty"`
 }
 
 type HeartbeatResponse struct {
@@ -54,9 +59,11 @@ type ProgressRequest struct {
 }
 
 var (
-	config     WorkerConfig
-	mu         sync.Mutex
-	activeJobs = make(map[uuid.UUID]context.CancelFunc)
+	config          WorkerConfig
+	mu              sync.Mutex
+	activeJobs      = make(map[uuid.UUID]context.CancelFunc)
+	lastMediaItemID uuid.UUID
+	lastSourcePath  string
 )
 
 func parseYAMLConfig(data []byte, cfg *WorkerConfig) error {
@@ -314,7 +321,7 @@ func main() {
 
 func poll(ctx context.Context) {
 	// Heartbeat request
-	url := fmt.Sprintf("%s/api/v1/worker/heartbeat", config.ServerURL)
+	url := fmt.Sprintf("%s/api/v1/workers:heartbeat", config.ServerURL)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, nil)
 	if err != nil {
 		slog.Error("failed to create heartbeat request", "error", err)
@@ -364,7 +371,7 @@ func poll(ctx context.Context) {
 			err := executeJob(jobCtx, hr.Job, hr.HWAccel)
 			if err != nil {
 				slog.Error("Job execution failed", "sub_job_id", hr.Job.ID, "error", err)
-				reportFailure(ctx, hr.Job.ID, err.Error())
+				reportFailure(ctx, hr.Job.JobID, hr.Job.ID, err.Error())
 			} else {
 				slog.Info("Job execution succeeded", "sub_job_id", hr.Job.ID)
 			}
@@ -372,7 +379,7 @@ func poll(ctx context.Context) {
 	}
 }
 
-func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) error {
+func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) (err error) {
 	// 1. Create temporary directory
 	tempDir, err := os.MkdirTemp(config.ScratchDir, fmt.Sprintf("prism-job-%s-", job.ID))
 	if err != nil {
@@ -380,12 +387,57 @@ func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) error
 	}
 	defer func() { _ = os.RemoveAll(tempDir) }()
 
-	sourcePath := filepath.Join(tempDir, "source.tmp")
+	// Defer block to clean up/reset the cached source file if the job fails.
+	defer func() {
+		if err != nil {
+			mu.Lock()
+			if lastSourcePath != "" {
+				slog.Info("Cleaning up cached source file due to failure", "path", lastSourcePath)
+				_ = os.Remove(lastSourcePath)
+				lastSourcePath = ""
+				lastMediaItemID = uuid.Nil
+			}
+			mu.Unlock()
+		}
+	}()
 
-	// 2. Download media
-	slog.Info("Downloading source media file", "sub_job_id", job.ID, "media_item_id", job.MediaItemID)
-	if err := downloadFile(ctx, job.MediaItemID, sourcePath); err != nil {
-		return fmt.Errorf("downloading source file: %w", err)
+	var sourcePath string
+	var cachedUsed bool
+
+	mu.Lock()
+	if lastMediaItemID == job.MediaItemID && lastSourcePath != "" {
+		if _, statErr := os.Stat(lastSourcePath); statErr == nil {
+			sourcePath = lastSourcePath
+			cachedUsed = true
+		}
+	}
+	mu.Unlock()
+
+	if cachedUsed {
+		slog.Info("Re-using cached source file", "sub_job_id", job.ID, "media_item_id", job.MediaItemID, "path", sourcePath)
+	} else {
+		// Clean up old cached file if it exists
+		mu.Lock()
+		if lastSourcePath != "" {
+			_ = os.Remove(lastSourcePath)
+			lastSourcePath = ""
+			lastMediaItemID = uuid.Nil
+		}
+		mu.Unlock()
+
+		newSourcePath := filepath.Join(config.ScratchDir, fmt.Sprintf("source-%s.tmp", job.MediaItemID))
+		slog.Info("Downloading source media file", "sub_job_id", job.ID, "media_item_id", job.MediaItemID)
+		if err = downloadFile(ctx, job.MediaItemID, newSourcePath); err != nil {
+			_ = os.Remove(newSourcePath)
+			return fmt.Errorf("downloading source file: %w", err)
+		}
+
+		mu.Lock()
+		lastMediaItemID = job.MediaItemID
+		lastSourcePath = newSourcePath
+		mu.Unlock()
+
+		sourcePath = newSourcePath
 	}
 
 	// 3. Probe file
@@ -395,7 +447,7 @@ func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) error
 	}
 
 	outputDir := filepath.Join(tempDir, "output")
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
+	if err = os.MkdirAll(outputDir, 0755); err != nil {
 		return fmt.Errorf("creating output dir: %w", err)
 	}
 
@@ -408,7 +460,7 @@ func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) error
 			lastReport = now
 			lastPct = pct
 			slog.Info("Transcode progress", "sub_job_id", job.ID, "pct", fmt.Sprintf("%.1f%%", pct))
-			reportProgress(ctx, job.ID, pct)
+			reportProgress(ctx, job.JobID, job.ID, pct)
 		}
 	}
 
@@ -443,6 +495,139 @@ func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) error
 		if err := ffmpeg.ExtractSubtitles(ctx, config.FFmpegPath, sourcePath, outputDir, probe.SubtitleStreams); err != nil {
 			slog.Warn("failed to extract embedded subtitles", "error", err)
 		}
+	} else if job.Type == "whisper" {
+		slog.Info("Starting Whisper Speech-to-Text transcription", "sub_job_id", job.ID, "model", job.WhisperModel)
+
+		modelName := job.WhisperModel
+		if modelName == "" {
+			modelName = "base"
+		}
+
+		if !strings.HasSuffix(modelName, ".bin") {
+			modelName = fmt.Sprintf("ggml-%s.bin", modelName)
+		}
+
+		// Download model locally to config.ScratchDir/models/ if not present
+		modelsDir := filepath.Join(config.ScratchDir, "models")
+		if err := os.MkdirAll(modelsDir, 0755); err != nil {
+			return fmt.Errorf("creating models directory: %w", err)
+		}
+
+		modelPath := filepath.Join(modelsDir, modelName)
+		if _, err := os.Stat(modelPath); os.IsNotExist(err) {
+			slog.Info("downloading whisper model from huggingface", "model", modelName, "dest", modelPath)
+			url := fmt.Sprintf("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/%s", modelName)
+
+			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+			if err != nil {
+				return fmt.Errorf("creating model download request: %w", err)
+			}
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return fmt.Errorf("downloading model: %w", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("model download failed with status %d", resp.StatusCode)
+			}
+
+			out, err := os.Create(modelPath)
+			if err != nil {
+				return fmt.Errorf("creating local model file: %w", err)
+			}
+			defer out.Close()
+
+			_, err = io.Copy(out, resp.Body)
+			if err != nil {
+				return fmt.Errorf("writing model file: %w", err)
+			}
+		}
+
+		// Extract WAV
+		tmpWav := filepath.Join(tempDir, "audio.wav")
+		ffmpegArgs := []string{
+			"-y",
+			"-i", sourcePath,
+			"-ar", "16000",
+			"-ac", "1",
+			"-c:a", "pcm_s16le",
+			tmpWav,
+		}
+		ffmpegCmd := exec.CommandContext(ctx, config.FFmpegPath, ffmpegArgs...)
+		if out, err := ffmpegCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("extracting audio via ffmpeg: %w (output: %s)", err, string(out))
+		}
+
+		// Run whisper-cli
+		tmpOutPrefix := filepath.Join(tempDir, "whisper-out")
+		whisperArgs := []string{
+			"-m", modelPath,
+			"-f", tmpWav,
+			"-ovtt",
+			"-of", tmpOutPrefix,
+			"--print-progress",
+		}
+
+		whisperCmd := exec.CommandContext(ctx, "whisper-cli", whisperArgs...)
+		stdout, err := whisperCmd.StdoutPipe()
+		if err != nil {
+			return fmt.Errorf("creating whisper stdout pipe: %w", err)
+		}
+		stderr, err := whisperCmd.StderrPipe()
+		if err != nil {
+			return fmt.Errorf("creating whisper stderr pipe: %w", err)
+		}
+
+		if err := whisperCmd.Start(); err != nil {
+			return fmt.Errorf("starting whisper-cli: %w", err)
+		}
+
+		progressChan := make(chan float64, 100)
+		scanPipe := func(r io.Reader) {
+			scanner := bufio.NewScanner(r)
+			re := regexp.MustCompile(`progress\s*=\s*(\d+)%`)
+			for scanner.Scan() {
+				line := scanner.Text()
+				matches := re.FindStringSubmatch(line)
+				if len(matches) > 1 {
+					if pct, err := strconv.ParseFloat(matches[1], 64); err == nil {
+						progressChan <- pct
+					}
+				}
+			}
+		}
+
+		go scanPipe(stdout)
+		go scanPipe(stderr)
+
+		go func() {
+			for pct := range progressChan {
+				progressFn(pct)
+			}
+		}()
+
+		err = whisperCmd.Wait()
+		close(progressChan)
+
+		if err != nil {
+			return fmt.Errorf("whisper-cli failed: %w", err)
+		}
+
+		// Move output VTT file to outputDir
+		vttFile := tmpOutPrefix + ".vtt"
+		destVTT := filepath.Join(outputDir, "whisper.vtt")
+		if err := os.Rename(vttFile, destVTT); err != nil {
+			// Fallback copy if rename fails across filesystems
+			vttBytes, readErr := os.ReadFile(vttFile)
+			if readErr != nil {
+				return fmt.Errorf("reading VTT output: %w", readErr)
+			}
+			if writeErr := os.WriteFile(destVTT, vttBytes, 0644); writeErr != nil {
+				return fmt.Errorf("writing VTT output: %w", writeErr)
+			}
+		}
 	} else {
 		return fmt.Errorf("unknown sub-job type: %s", job.Type)
 	}
@@ -456,7 +641,7 @@ func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) error
 
 	// 7. Upload ZIP
 	slog.Info("Uploading transcode output bundle to server", "sub_job_id", job.ID)
-	if err := uploadBundle(ctx, job.ID, zipPath); err != nil {
+	if err := uploadBundle(ctx, job.JobID, job.ID, zipPath); err != nil {
 		return fmt.Errorf("uploading bundle: %w", err)
 	}
 
@@ -465,7 +650,7 @@ func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) error
 }
 
 func downloadFile(ctx context.Context, mediaID uuid.UUID, destPath string) error {
-	url := fmt.Sprintf("%s/api/v1/worker/media/%s/download", config.ServerURL, mediaID)
+	url := fmt.Sprintf("%s/api/v1/media/%s/source", config.ServerURL, mediaID)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return err
@@ -492,15 +677,15 @@ func downloadFile(ctx context.Context, mediaID uuid.UUID, destPath string) error
 	return err
 }
 
-func reportProgress(ctx context.Context, subJobID uuid.UUID, progress float64) {
-	url := fmt.Sprintf("%s/api/v1/worker/subjobs/%s/progress", config.ServerURL, subJobID)
+func reportProgress(ctx context.Context, jobID, subJobID uuid.UUID, progress float64) {
+	url := fmt.Sprintf("%s/api/v1/jobs/%s/subjobs/%s", config.ServerURL, jobID, subJobID)
 	payload := ProgressRequest{
 		Progress: progress,
 		Status:   "processing",
 	}
 
 	data, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, "PATCH", url, bytes.NewReader(data))
 	if err != nil {
 		return
 	}
@@ -513,8 +698,8 @@ func reportProgress(ctx context.Context, subJobID uuid.UUID, progress float64) {
 	}
 }
 
-func reportFailure(ctx context.Context, subJobID uuid.UUID, errMsg string) {
-	url := fmt.Sprintf("%s/api/v1/worker/subjobs/%s/progress", config.ServerURL, subJobID)
+func reportFailure(ctx context.Context, jobID, subJobID uuid.UUID, errMsg string) {
+	url := fmt.Sprintf("%s/api/v1/jobs/%s/subjobs/%s", config.ServerURL, jobID, subJobID)
 	payload := ProgressRequest{
 		Progress: 0,
 		Status:   "failed",
@@ -522,7 +707,7 @@ func reportFailure(ctx context.Context, subJobID uuid.UUID, errMsg string) {
 	}
 
 	data, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, "PATCH", url, bytes.NewReader(data))
 	if err != nil {
 		return
 	}
@@ -535,8 +720,8 @@ func reportFailure(ctx context.Context, subJobID uuid.UUID, errMsg string) {
 	}
 }
 
-func uploadBundle(ctx context.Context, subJobID uuid.UUID, zipPath string) error {
-	url := fmt.Sprintf("%s/api/v1/worker/subjobs/%s/bundle", config.ServerURL, subJobID)
+func uploadBundle(ctx context.Context, jobID, subJobID uuid.UUID, zipPath string) error {
+	url := fmt.Sprintf("%s/api/v1/jobs/%s/subjobs/%s/bundle", config.ServerURL, jobID, subJobID)
 
 	file, err := os.Open(zipPath)
 	if err != nil {
@@ -564,7 +749,7 @@ func uploadBundle(ctx context.Context, subJobID uuid.UUID, zipPath string) error
 		}
 	}()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, pr)
+	req, err := http.NewRequestWithContext(ctx, "PUT", url, pr)
 	if err != nil {
 		return err
 	}
@@ -670,7 +855,7 @@ func registerEphemeral(serverURL, token, name string) (string, error) {
 		return "", err
 	}
 
-	url := fmt.Sprintf("%s/api/v1/worker/register", strings.TrimSuffix(serverURL, "/"))
+	url := fmt.Sprintf("%s/api/v1/workers:register", strings.TrimSuffix(serverURL, "/"))
 	resp, err := http.Post(url, "application/json", bytes.NewReader(data))
 	if err != nil {
 		return "", err
