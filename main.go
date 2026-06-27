@@ -465,7 +465,8 @@ func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) (err 
 	}
 
 	// 5. Transcode based on Type
-	if job.Type == "video" {
+	switch job.Type {
+	case "video":
 		if job.Profile == nil {
 			return fmt.Errorf("video sub-job has no profile specified")
 		}
@@ -490,12 +491,12 @@ func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) (err 
 		if err := ffmpeg.TranscodeDASH(ctx, config.FFmpegPath, opts); err != nil {
 			return fmt.Errorf("transcode process: %w", err)
 		}
-	} else if job.Type == "subtitles" {
+	case "subtitles":
 		slog.Info("Starting subtitle extraction", "sub_job_id", job.ID)
 		if err := ffmpeg.ExtractSubtitles(ctx, config.FFmpegPath, sourcePath, outputDir, probe.SubtitleStreams); err != nil {
 			slog.Warn("failed to extract embedded subtitles", "error", err)
 		}
-	} else if job.Type == "whisper" {
+	case "whisper":
 		slog.Info("Starting Whisper Speech-to-Text transcription", "sub_job_id", job.ID, "model", job.WhisperModel)
 
 		modelName := job.WhisperModel
@@ -527,7 +528,9 @@ func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) (err 
 			if err != nil {
 				return fmt.Errorf("downloading model: %w", err)
 			}
-			defer resp.Body.Close()
+			defer func() {
+				_ = resp.Body.Close()
+			}()
 
 			if resp.StatusCode != http.StatusOK {
 				return fmt.Errorf("model download failed with status %d", resp.StatusCode)
@@ -537,11 +540,17 @@ func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) (err 
 			if err != nil {
 				return fmt.Errorf("creating local model file: %w", err)
 			}
-			defer out.Close()
+			defer func() {
+				_ = out.Close()
+			}()
 
 			_, err = io.Copy(out, resp.Body)
 			if err != nil {
 				return fmt.Errorf("writing model file: %w", err)
+			}
+
+			if err := out.Close(); err != nil {
+				return fmt.Errorf("closing model file: %w", err)
 			}
 		}
 
@@ -628,7 +637,7 @@ func executeJob(ctx context.Context, job *TranscodeSubJob, hwaccel string) (err 
 				return fmt.Errorf("writing VTT output: %w", writeErr)
 			}
 		}
-	} else {
+	default:
 		return fmt.Errorf("unknown sub-job type: %s", job.Type)
 	}
 
