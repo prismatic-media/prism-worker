@@ -47,9 +47,10 @@ type TranscodeSubJob struct {
 }
 
 type HeartbeatResponse struct {
-	Threads int              `json:"threads"`
-	HWAccel string           `json:"hwaccel"`
-	Job     *TranscodeSubJob `json:"job"`
+	Threads       int              `json:"threads"`
+	HWAccel       string           `json:"hwaccel"`
+	Job           *TranscodeSubJob `json:"job"`
+	CancelledJobs []uuid.UUID      `json:"cancelled_jobs,omitempty"`
 }
 
 type ProgressRequest struct {
@@ -350,6 +351,16 @@ func poll(ctx context.Context) {
 	if err := json.NewDecoder(resp.Body).Decode(&hr); err != nil {
 		slog.Error("failed to decode heartbeat response", "error", err)
 		return
+	}
+
+	for _, cid := range hr.CancelledJobs {
+		mu.Lock()
+		cancel, exists := activeJobs[cid]
+		mu.Unlock()
+		if exists {
+			slog.Info("Cancelling job via heartbeat", "sub_job_id", cid)
+			cancel()
+		}
 	}
 
 	if hr.Job != nil {
