@@ -818,7 +818,7 @@ func zipDir(src string, dest string) error {
 		if err != nil {
 			return err
 		}
-		header.Name = relPath
+		header.Name = filepath.ToSlash(relPath)
 		header.Method = zip.Deflate
 
 		writer, err := archive.CreateHeader(header)

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"archive/zip"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -145,3 +147,46 @@ func TestLoadConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestZipDirSlashNormalization(t *testing.T) {
+	tempDir := t.TempDir()
+	srcDir := filepath.Join(tempDir, "src")
+	if err := os.MkdirAll(filepath.Join(srcDir, "1080p"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	testFile := filepath.Join(srcDir, "1080p", "seg_00003.m4s")
+	if err := os.WriteFile(testFile, []byte("segment data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	destZip := filepath.Join(tempDir, "bundle.zip")
+	if err := zipDir(srcDir, destZip); err != nil {
+		t.Fatalf("zipDir failed: %v", err)
+	}
+
+	// Open and check the zip file
+	r, err := zip.OpenReader(destZip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	found := false
+	for _, f := range r.File {
+		if f.Name == "1080p/seg_00003.m4s" {
+			found = true
+		}
+		// In a zip file, it is illegal/incorrect to have backslashes in header paths
+		if filepath.Separator == '\\' || true { // check on all systems just in case
+			if filepath.ToSlash(f.Name) != f.Name {
+				t.Errorf("expected header name to use forward slashes, got: %q", f.Name)
+			}
+		}
+	}
+
+	if !found {
+		t.Error("expected to find '1080p/seg_00003.m4s' in zip file")
+	}
+}
+
