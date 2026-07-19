@@ -59,6 +59,14 @@ jobs:
           GOOS: linux
           GOARCH: arm64
         run: go build -v -o prism-worker-linux-arm64 main.go
+
+      - name: Build Worker Binary (Windows amd64)
+        env:
+          CGO_ENABLED: 0
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -v -o prism-worker-windows-amd64.exe main.go
+
       - name: Upload Release Binaries Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -66,6 +74,7 @@ jobs:
           path: |
             prism-worker-linux-amd64
             prism-worker-linux-arm64
+            prism-worker-windows-amd64.exe
           retention-days: 1
 
   create-release:
@@ -113,6 +122,7 @@ jobs:
           files: |
             prism-worker-linux-amd64
             prism-worker-linux-arm64
+            prism-worker-windows-amd64.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
