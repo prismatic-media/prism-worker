@@ -170,7 +170,7 @@ func TestZipDirSlashNormalization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	found := false
 	for _, f := range r.File {
